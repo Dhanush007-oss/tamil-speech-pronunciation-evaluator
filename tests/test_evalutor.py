@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
 from config import SAMPLE_RATE
 from evaluator import (
     analyze_fluency,
+    check_tamil_spelling,
     compare_acoustics,
     evaluate_pronunciation,
     evaluate_teacher,
@@ -21,6 +22,8 @@ EXPECTED_VALIDATION_KEYS = {"is_valid", "purity", "has_latin", "message"}
 EXPECTED_TEACHER_KEYS = {
     "transcription",
     "script_valid",
+    "spelling_valid",
+    "suggested_correction",
     "purity",
     "syllables",
     "status",
@@ -55,7 +58,7 @@ EXPECTED_EVAL_KEYS = {
 
 def test_segment_tamil_graphemes():
     assert segment_tamil_graphemes("வாழைப்பழம்") == ["வா", "ழை", "ப்", "ப", "ழ", "ம்"]
-    assert segment_tamil_graphemes("தமிழ்") == ["த", "மி", "ழ்"]
+    assert segment_tamil_graphemes("தமிழ்.") == ["த", "மி", "ழ்"]
     assert segment_tamil_graphemes("   ") == []
 
 
@@ -73,18 +76,44 @@ def test_validate_tamil_script():
     assert tanglish["purity"] == 0.0
 
 
+def test_check_tamil_spelling():
+    missing_sandhi = check_tamil_spelling("வாழை பழம்")
+    assert missing_sandhi["spelling_valid"] is False
+    assert missing_sandhi["suggested_text"] == "வாழைப்பழம்"
+
+    distorted = check_tamil_spelling("வாழை பயம்.")
+    assert distorted["spelling_valid"] is False
+    assert distorted["suggested_text"] == "வாழைப்பழம்"
+
+    malformed = check_tamil_spelling("வாழ்்")
+    assert malformed["spelling_valid"] is False
+
+    valid = check_tamil_spelling("வாழைப்பழம்")
+    assert valid["spelling_valid"] is True
+    assert valid["suggested_text"] == "வாழைப்பழம்"
+
+
 def test_evaluate_teacher():
     valid = evaluate_teacher("வணக்கம்")
     assert set(valid.keys()) == EXPECTED_TEACHER_KEYS
     assert valid["script_valid"] is True
+    assert valid["spelling_valid"] is True
+    assert valid["status"] == "Ready as Benchmark"
     assert valid["syllables"] == ["வ", "ண", "க்", "க", "ம்"]
+
+    misspelled = evaluate_teacher("வாழை பழம்")
+    assert misspelled["script_valid"] is True
+    assert misspelled["spelling_valid"] is False
+    assert misspelled["status"] == "Spelling Check Needed"
+    assert misspelled["suggested_correction"] == "வாழைப்பழம்"
 
     invalid = evaluate_teacher("")
     assert invalid["script_valid"] is False
+    assert invalid["spelling_valid"] is False
     assert invalid["syllables"] == []
 
 
-def test_evaluate_exact_and_spaced_match():
+def test_evaluate_exact_spaced_and_punctuated_match():
     exact = evaluate_pronunciation("வாழைப்பழம்", "வாழைப்பழம்")
     assert set(exact.keys()) == EXPECTED_EVAL_KEYS
     assert exact["wording_match"] is True
@@ -93,10 +122,14 @@ def test_evaluate_exact_and_spaced_match():
     assert exact["pronunciation_status"] == "Accurate Pronunciation"
     assert exact["confidence_label"] == "High"
 
-    spaced = evaluate_pronunciation("மர வெள்ளிக் கிழங்கு", "மரவெள்ளிக்கிழங்கு")
+    spaced = evaluate_pronunciation("உயிர் வாழ்வேன்", "உயிர்வாழ்வேன்")
     assert spaced["wording_match"] is True
     assert spaced["pronunciation_match"] is True
     assert spaced["similarity"] == 100.0
+
+    punctuated = evaluate_pronunciation("வாழைப்பழம்.", "வாழைப்பழம்")
+    assert punctuated["wording_match"] is True
+    assert punctuated["similarity"] == 100.0
 
 
 def test_evaluate_accent_gap_on_matching_word():
@@ -128,6 +161,15 @@ def test_evaluate_phonetic_shift_with_solution():
     assert "ல" in result["solution"] and "ழ" in result["solution"]
 
 
+def test_evaluate_misspelled_student_attempt():
+    result = evaluate_pronunciation("வாழை பயம்", "வாழைப்பழம்")
+    assert result["wording_match"] is False
+    assert result["pronunciation_match"] is False
+    assert result["similarity"] == 75.3
+    assert result["pronunciation_status"] == "Phonetic Shift Detected"
+    assert "வாழைப்பழம்" in result["solution"]
+
+
 def test_evaluate_spoken_diglossia_mode():
     literary = evaluate_pronunciation("கட", "கடை", mode="literary")
     assert literary["wording_match"] is False
@@ -149,7 +191,7 @@ def test_evaluate_different_word_mismatch():
     assert result["wording_match"] is False
     assert result["pronunciation_match"] is False
     assert result["pronunciation_status"] == "Word Mismatch"
-    assert "Different word spoken" in result["characteristics"]
+    assert "Wrong word spoken" in result["characteristics"]
     assert "வா · ழை · ப் · ப · ழ · ம்" in result["solution"]
 
 
@@ -160,7 +202,7 @@ def test_evaluate_shared_prefix_different_word():
     assert result["similarity"] == 48.2
     assert result["pronunciation_status"] == "Word Mismatch"
     assert result["confidence_label"] == "Low"
-    assert "Different word spoken" in result["characteristics"]
+    assert "Wrong word spoken" in result["characteristics"]
     assert "ல / ள / ழ" not in result["characteristics"]
 
 

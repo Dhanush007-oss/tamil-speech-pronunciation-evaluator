@@ -15,6 +15,7 @@ from config import (
 )
 from evaluator import (
     analyze_fluency,
+    check_tamil_spelling,
     compare_acoustics,
     decode_audio_pcm,
     evaluate_pronunciation,
@@ -22,6 +23,7 @@ from evaluator import (
     extract_phonetic_embeddings,
     generate_reference_audio,
     load_asr_pipeline,
+    segment_tamil_graphemes,
     transcribe_audio,
     validate_tamil_script,
 )
@@ -63,7 +65,7 @@ def inject_ui_styles() -> None:
             display: flex;
             flex-wrap: wrap;
             gap: 0.4rem;
-            margin: 0.45rem 0 0.8rem 0;
+            margin: 0.4rem 0 0.8rem 0;
         }
         .syllable-chip {
             padding: 0.22rem 0.62rem;
@@ -127,6 +129,11 @@ def get_reference_audio(text: str) -> bytes:
 def clear_session_attempt() -> None:
     st.session_state["round_id"] += 1
     st.session_state["evaluation"] = None
+    st.session_state["eval_signature"] = None
+
+
+def apply_teacher_correction(widget_key: str, corrected_text: str) -> None:
+    st.session_state[widget_key] = corrected_text
 
 
 def render_speaker_panel(
@@ -198,17 +205,33 @@ def render_speaker_panel(
 
         final_text = transcript
         if allow_edit:
+            widget_key = f"teacher_edit_{round_id}_{model_name}_{audio_hash[:8]}"
+            if widget_key not in st.session_state:
+                st.session_state[widget_key] = transcript
+
             edited = st.text_input(
                 "Confirm or edit Teacher Tamil text (optional)",
-                value=transcript,
-                key=f"teacher_edit_{round_id}_{audio_hash[:8]}",
+                key=widget_key,
                 help="Fix any ASR mishearing in pure Tamil script before evaluating the Student.",
             ).strip()
             final_text = edited
+
             if edited:
                 edit_check = validate_tamil_script(edited)
                 if not edit_check["is_valid"]:
                     st.warning(edit_check["message"])
+                else:
+                    spelling_check = check_tamil_spelling(edited)
+                    if not spelling_check["spelling_valid"]:
+                        st.warning(spelling_check["issue"])
+                        suggested = spelling_check["suggested_text"]
+                        if suggested and suggested != edited:
+                            st.button(
+                                f"Use Correct Tamil Word: {suggested}",
+                                key=f"fix_{widget_key}",
+                                on_click=apply_teacher_correction,
+                                args=(widget_key, suggested),
+                            )
 
         return {
             "transcript": final_text,
@@ -221,13 +244,14 @@ def render_speaker_panel(
 def render_teacher_card(teacher: dict) -> None:
     with st.container(border=True):
         st.markdown("#### Teacher Benchmark")
+        is_ready = teacher["script_valid"] and teacher["spelling_valid"]
         col1, col2 = st.columns(2)
         with col1:
             st.metric(
                 label="Tamil Script Purity",
                 value=f"{teacher['purity']}%",
                 delta=teacher["status"],
-                delta_color="normal" if teacher["script_valid"] else "inverse",
+                delta_color="normal" if is_ready else "inverse",
             )
         with col2:
             st.metric(
@@ -237,12 +261,18 @@ def render_teacher_card(teacher: dict) -> None:
                 delta_color="off",
             )
 
-        if teacher["script_valid"]:
+        if not teacher["script_valid"]:
+            st.warning(teacher["message"])
+        elif not teacher["spelling_valid"]:
+            st.warning(teacher["message"])
+            st.markdown(f"**Current Benchmark:** {teacher['transcription']}")
+            if teacher["suggested_correction"]:
+                st.markdown(f"**Correct Tamil Word:** {teacher['suggested_correction']}")
+            render_syllable_chips(teacher["syllables"])
+        else:
             st.markdown(f"**Confirmed Tamil Benchmark:** {teacher['transcription']}")
             st.markdown("**Syllable Breakdown**")
             render_syllable_chips(teacher["syllables"])
-        else:
-            st.warning(teacher["message"])
 
 
 def render_student_card(student: dict) -> None:
@@ -296,6 +326,15 @@ def render_student_card(student: dict) -> None:
                 delta_color="normal" if student["wording_match"] else "inverse",
             )
 
+        if not student["pronunciation_match"] and student["target"]:
+            w_col1, w_col2 = st.columns(2)
+            with w_col1:
+                st.markdown(f"**Correct Tamil Word:** {student['target']}")
+            with w_col2:
+                heard = student["transcription"] if student["transcription"] else "(No Tamil speech)"
+                st.markdown(f"**Student Said:** {heard}")
+            render_syllable_chips(segment_tamil_graphemes(student["target"]))
+
         st.caption(
             f"Audio Fluency: {student['fluency_status']} ({student['speech_duration_s']}s active speech)"
         )
@@ -322,6 +361,7 @@ def main() -> None:
     st.session_state.setdefault("embeddings", {})
     st.session_state.setdefault("round_id", 0)
     st.session_state.setdefault("evaluation", None)
+    st.session_state.setdefault("eval_signature", None)
 
     round_id = st.session_state["round_id"]
 
@@ -383,6 +423,22 @@ def main() -> None:
     st.divider()
     st.header("Pronunciation Evaluation")
 
+    current_signature = (
+        teacher_data["cache_key"] if teacher_data else None,
+        teacher_data["transcript"] if teacher_data else "",
+        student_data["cache_key"] if student_data else None,
+        student_data["transcript"] if student_data else "",
+        eval_mode,
+    )
+
+    if (
+        st.session_state["evaluation"] is not None
+        and st.session_state["eval_signature"] != current_signature
+    ):
+        st.session_state["evaluation"] = None
+        st.session_state["eval_signature"] = None
+        st.info("New recording, benchmark text, or mode detected. Click **Evaluate Pronunciation** to refresh.")
+
     btn_col1, btn_col2 = st.columns([3, 1])
     with btn_col1:
         evaluate_clicked = st.button(
@@ -439,6 +495,7 @@ def main() -> None:
                         fluency=s_fluency,
                     ),
                 }
+                st.session_state["eval_signature"] = current_signature
 
     evaluation = st.session_state["evaluation"]
     if evaluation is not None:

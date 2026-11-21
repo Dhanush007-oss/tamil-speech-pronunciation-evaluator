@@ -3,6 +3,7 @@ import io
 import os
 import subprocess
 import tempfile
+import unicodedata
 
 import numpy as np
 import torch
@@ -25,6 +26,7 @@ from config import (
     SAMPLE_RATE,
     SPOKEN_DROPPED_ENDINGS,
     SPOKEN_WORD_MATCH_THRESHOLD,
+    TAMIL_WORD_SPELLING_MAP,
     VOWEL_LENGTH_PAIRS,
     WORD_MATCH_THRESHOLD,
 )
@@ -48,7 +50,7 @@ def load_asr_pipeline(model_name: str):
         model=model_name,
         device=device,
     )
-    # Small beam search recovers soft/accented Tamil onsets while token cap blocks CPU stalls
+    # Small beam search recovers soft/accented Tamil onsets while token cap prevents CPU stalls
     gen_cfg = getattr(asr_pipe.model, "generation_config", None)
     if gen_cfg is not None:
         gen_cfg.num_beams = ASR_NUM_BEAMS
@@ -128,7 +130,7 @@ def _trim_silence(
     if peak < 0.004:
         return samples
 
-    # Low onset threshold keeps soft Tamil consonants like 'வ' and 'ம' intact
+    # Low onset threshold preserves soft Tamil openings like 'வ' and 'ம'
     active_idx = np.flatnonzero(rms > max(0.004, peak * 0.05))
     if active_idx.size == 0:
         return samples
@@ -139,9 +141,13 @@ def _trim_silence(
     return samples[start:end]
 
 
-def _prepare_asr_audio(samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
-    trimmed = _trim_silence(samples, sample_rate=sample_rate, pad_s=0.30)
-    cushion_len = int(0.20 * sample_rate)
+def _prepare_asr_audio(
+    samples: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    cushion_s: float = 0.20,
+) -> np.ndarray:
+    trimmed = _trim_silence(samples, sample_rate=sample_rate, pad_s=0.30 if cushion_s > 0 else 0.05)
+    cushion_len = int(cushion_s * sample_rate)
     max_speech_samples = max(1, MAX_AUDIO_SECONDS * sample_rate - 2 * cushion_len)
     if trimmed.size > max_speech_samples:
         trimmed = trimmed[:max_speech_samples]
@@ -152,6 +158,9 @@ def _prepare_asr_audio(samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> n
         return np.array([], dtype=np.float32)
 
     normalized = centered * (0.90 / peak_abs)
+    if cushion_len == 0:
+        return np.ascontiguousarray(normalized, dtype=np.float32)
+
     cushion = np.zeros(cushion_len, dtype=np.float32)
     return np.ascontiguousarray(np.concatenate([cushion, normalized, cushion]), dtype=np.float32)
 
@@ -164,7 +173,7 @@ def transcribe_audio(asr_pipe, audio_bytes: bytes, suffix: str = ".wav") -> str:
     if samples.size == 0:
         return ""
 
-    audio_array = _prepare_asr_audio(samples)
+    audio_array = _prepare_asr_audio(samples, cushion_s=0.20)
     if audio_array.size == 0:
         return ""
 
@@ -179,11 +188,8 @@ def extract_phonetic_embeddings(asr_pipe, samples: np.ndarray) -> np.ndarray | N
     if asr_pipe is None or samples.size == 0:
         return None
 
-    trimmed = _trim_silence(samples, pad_s=0.05)
-    max_samples = MAX_AUDIO_SECONDS * SAMPLE_RATE
-    if trimmed.size > max_samples:
-        trimmed = trimmed[:max_samples]
-    if trimmed.size < int(0.05 * SAMPLE_RATE):
+    audio_array = _prepare_asr_audio(samples, cushion_s=0.0)
+    if audio_array.size < int(0.05 * SAMPLE_RATE):
         return None
 
     feature_extractor = getattr(asr_pipe, "feature_extractor", None)
@@ -192,7 +198,6 @@ def extract_phonetic_embeddings(asr_pipe, samples: np.ndarray) -> np.ndarray | N
         return None
 
     try:
-        audio_array = np.ascontiguousarray(trimmed, dtype=np.float32)
         inputs = feature_extractor(
             audio_array,
             sampling_rate=SAMPLE_RATE,
@@ -205,8 +210,8 @@ def extract_phonetic_embeddings(asr_pipe, samples: np.ndarray) -> np.ndarray | N
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return None
 
-    # Whisper encoder emits 50 frames/sec (20ms stride); slice to active speech only
-    n_frames = max(2, min(hidden.shape[0], int(round((trimmed.size / SAMPLE_RATE) * 50))))
+    # Whisper encoder emits 50 frames/sec (20ms stride); keep active speech frames only
+    n_frames = max(2, min(hidden.shape[0], int(round((audio_array.size / SAMPLE_RATE) * 50))))
     active = hidden[:n_frames]
     if active.shape[0] > MAX_DTW_FRAMES:
         idx = np.linspace(0, active.shape[0] - 1, MAX_DTW_FRAMES, dtype=int)
@@ -390,9 +395,9 @@ def compare_acoustics(
         and teacher_emb.shape[0] >= 2
         and student_emb.shape[0] >= 2
     ):
-        shared_mean = np.mean(np.vstack([teacher_emb, student_emb]), axis=0, keepdims=True)
-        t_centered = teacher_emb - shared_mean
-        s_centered = student_emb - shared_mean
+        # Partial temporal mean removal cancels speaker/mic bias without collapsing short vowels
+        t_centered = teacher_emb - 0.70 * np.mean(teacher_emb, axis=0, keepdims=True)
+        s_centered = student_emb - 0.70 * np.mean(student_emb, axis=0, keepdims=True)
         if np.linalg.norm(t_centered) > 1e-6 and np.linalg.norm(s_centered) > 1e-6:
             emb_score = _dtw_cosine_score(t_centered, s_centered)
         else:
@@ -471,14 +476,77 @@ def validate_tamil_script(text: str) -> dict:
     }
 
 
+def _is_tamil_combining(ch: str) -> bool:
+    return ch == "\u0B82" or ("\u0BBE" <= ch <= "\u0BCD") or ch == "\u0BD7"
+
+
+def _strip_punctuation(text: str) -> str:
+    return "".join(ch for ch in text if not unicodedata.category(ch).startswith("P"))
+
+
+def check_tamil_spelling(text: str) -> dict:
+    cleaned = " ".join(_strip_punctuation(text).strip().split())
+    if not cleaned:
+        return {"spelling_valid": False, "suggested_text": "", "issue": "No Tamil text to verify."}
+
+    for word in cleaned.split():
+        if _is_tamil_combining(word[0]):
+            return {
+                "spelling_valid": False,
+                "suggested_text": cleaned,
+                "issue": f"Invalid Tamil character sequence at the start of '{word}'.",
+            }
+        if "\u0BCD\u0BCD" in word:
+            return {
+                "spelling_valid": False,
+                "suggested_text": cleaned,
+                "issue": f"Duplicate pulli mark detected in '{word}'.",
+            }
+        for prev, curr in zip(word, word[1:]):
+            if ("\u0BBE" <= prev <= "\u0BCC") and ("\u0BBE" <= curr <= "\u0BCC"):
+                return {
+                    "spelling_valid": False,
+                    "suggested_text": cleaned,
+                    "issue": f"Malformed vowel sign sequence detected in '{word}'.",
+                }
+
+    compact = _compact_tamil(cleaned)
+    if compact in TAMIL_WORD_SPELLING_MAP:
+        corrected = TAMIL_WORD_SPELLING_MAP[compact]
+        return {
+            "spelling_valid": False,
+            "suggested_text": corrected,
+            "issue": f"Spelling or sandhi issue detected: '{cleaned}' should be '{corrected}'.",
+        }
+
+    words = cleaned.split()
+    fixed_words: list[str] = []
+    changed = False
+    for word in words:
+        if word in TAMIL_WORD_SPELLING_MAP:
+            fixed_words.append(TAMIL_WORD_SPELLING_MAP[word])
+            changed = True
+        else:
+            fixed_words.append(word)
+
+    if changed:
+        corrected = " ".join(fixed_words)
+        return {
+            "spelling_valid": False,
+            "suggested_text": corrected,
+            "issue": f"Spelling issue detected: '{cleaned}' should be '{corrected}'.",
+        }
+
+    return {"spelling_valid": True, "suggested_text": cleaned, "issue": ""}
+
+
 def segment_tamil_graphemes(text: str) -> list[str]:
     # Keep Tamil combining vowel signs and pulli attached to their base consonant
     graphemes: list[str] = []
-    for ch in text.strip():
+    for ch in _strip_punctuation(text).strip():
         if ch.isspace():
             continue
-        is_combining = ch == "\u0B82" or ("\u0BBE" <= ch <= "\u0BCD") or ch == "\u0BD7"
-        if is_combining and graphemes:
+        if _is_tamil_combining(ch) and graphemes:
             graphemes[-1] += ch
         else:
             graphemes.append(ch)
@@ -486,7 +554,7 @@ def segment_tamil_graphemes(text: str) -> list[str]:
 
 
 def _compact_tamil(text: str) -> str:
-    return "".join(ch for ch in text if not ch.isspace())
+    return "".join(ch for ch in _strip_punctuation(text) if not ch.isspace())
 
 
 def _tamil_similarity(spoken: str, target: str) -> float:
@@ -508,7 +576,7 @@ def _tamil_similarity(spoken: str, target: str) -> float:
 def _normalize_spoken_tamil(text: str) -> str:
     # Normalize common conversational Tamil word-final diglossia drops
     normalized_words: list[str] = []
-    for word in text.strip().split():
+    for word in _strip_punctuation(text).strip().split():
         base = word
         for ending in SPOKEN_DROPPED_ENDINGS:
             if len(base) > len(ending) + 1 and base.endswith(ending):
@@ -543,13 +611,27 @@ def evaluate_teacher(teacher_text: str, fluency: dict | None = None) -> dict:
         "fluency_status": "Not measured",
     }
 
+    if not validation["is_valid"]:
+        spelling_valid = False
+        suggested_correction = ""
+        status = "Invalid Benchmark"
+        message = validation["message"]
+    else:
+        spelling = check_tamil_spelling(cleaned)
+        spelling_valid = spelling["spelling_valid"]
+        suggested_correction = "" if spelling_valid else spelling["suggested_text"]
+        status = "Ready as Benchmark" if spelling_valid else "Spelling Check Needed"
+        message = validation["message"] if spelling_valid else spelling["issue"]
+
     return {
         "transcription": cleaned,
         "script_valid": validation["is_valid"],
+        "spelling_valid": spelling_valid,
+        "suggested_correction": suggested_correction,
         "purity": validation["purity"],
         "syllables": syllables,
-        "status": "Ready as Benchmark" if validation["is_valid"] else "Invalid Benchmark",
-        "message": validation["message"],
+        "status": status,
+        "message": message,
         "pause_count": fluency_info["pause_count"],
         "speech_duration_s": fluency_info["speech_duration_s"],
         "fluency_status": fluency_info["fluency_status"],
@@ -576,8 +658,10 @@ def _analyze_pronunciation(
     steps: list[str] = []
 
     if similarity < MODERATE_CONFIDENCE:
-        notes.append(f"Different word spoken: Student said '{spoken}' instead of '{target}'.")
-        steps.append(f"Target word is '{target}' — practice it slowly syllable by syllable: {syllable_guide}.")
+        notes.append(
+            f"Wrong word spoken: Student said '{spoken}', which does not match the correct word '{target}'."
+        )
+        steps.append(f"Correct word to say: '{target}' ({syllable_guide}).")
         steps.append("Listen to the Teacher's clip and the reference audio below, then repeat clearly.")
         return " ".join(notes), steps
 
@@ -614,7 +698,7 @@ def _analyze_pronunciation(
         if diff < 0:
             notes.append("Shortened or incomplete syllable delivery.")
             steps.append(
-                f"Pronounce all {len(target_graphemes)} syllables completely without dropping endings: {syllable_guide}."
+                f"Correct word is '{target}' — pronounce all {len(target_graphemes)} syllables completely: {syllable_guide}."
             )
         elif diff > 0:
             notes.append("Extra syllables or trailing sounds detected.")
@@ -624,7 +708,7 @@ def _analyze_pronunciation(
 
         if not notes:
             notes.append("Minor syllable articulation difference compared to the Teacher.")
-            steps.append(f"Repeat '{target}' cleanly syllable by syllable: {syllable_guide}.")
+            steps.append(f"Correct word is '{target}' — repeat cleanly syllable by syllable: {syllable_guide}.")
 
     if fluency and fluency.get("pause_count", 0) >= 2:
         notes.append(f"Choppy pacing ({fluency['pause_count']} mid-utterance pauses detected).")
@@ -735,7 +819,9 @@ def evaluate_pronunciation(
         if acoustic_score is None:
             overall_score = confidence_score
             pronunciation_match = True
-            confidence_label = "High" if (confidence_score >= HIGH_CONFIDENCE or diglossia_accepted) else "Moderate"
+            confidence_label = (
+                "High" if (confidence_score >= HIGH_CONFIDENCE or diglossia_accepted) else "Moderate"
+            )
             status = (
                 "Accurate Pronunciation (Spoken)"
                 if diglossia_accepted

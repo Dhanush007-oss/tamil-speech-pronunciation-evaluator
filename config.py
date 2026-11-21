@@ -21,6 +21,22 @@ SAMPLE_WORDS = {
     "நன்றி": "Keep the nasal 'ன்' light and follow it with a crisp 'றி'.",
 }
 
+# Misspelled or missing-sandhi Tamil forms mapped to standard Tamil spelling
+TAMIL_WORD_SPELLING_MAP = {
+    "வாழைபழம்": "வாழைப்பழம்",
+    "வாழைபயம்": "வாழைப்பழம்",
+    "வாழாப்பழம்": "வாழைப்பழம்",
+    "வாழாபழம்": "வாழைப்பழம்",
+    "வாளைப்பழம்": "வாழைப்பழம்",
+    "வாளைப்பலம்": "வாழைப்பழம்",
+    "வாலைப்பலம்": "வாழைப்பழம்",
+    "தமில்": "தமிழ்",
+    "தமிள்": "தமிழ்",
+    "வணகம்": "வணக்கம்",
+    "வனக்கம்": "வணக்கம்",
+    "நன்ரி": "நன்றி",
+}
+
 # Tamil consonant confusion sets paired with diagnostic descriptions and corrective tips
 CONFUSION_GROUPS = (
     {
@@ -57,5 +73,5 @@ HIGH_CONFIDENCE = 85.0
 MODERATE_CONFIDENCE = 65.0
 WORD_MATCH_THRESHOLD = 85.0
 SPOKEN_WORD_MATCH_THRESHOLD = 78.0
-HIGH_ACOUSTIC = 72.0
-MODERATE_ACOUSTIC = 55.0
+HIGH_ACOUSTIC = 70.0
+MODERATE_ACOUSTIC = 52.0
