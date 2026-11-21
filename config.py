@@ -3,10 +3,14 @@ ALT_MODEL = "vasista22/whisper-tamil-medium"
 
 SAMPLE_RATE = 16000
 MAX_AUDIO_SECONDS = 30
+MAX_AUDIO_BYTES = 10 * 1024 * 1024
 MAX_DECODE_TOKENS = 128
 FFMPEG_TIMEOUT_S = 30
+MAX_SESSION_CACHE = 20
+
 MIN_PAUSE_MS = 220
 MAX_DTW_FRAMES = 200
+
 SAMPLE_WORDS = {
     "வாழைப்பழம்": "Hold the long vowel in 'வா' and curl the tongue back clearly for both 'ழை' and 'ழ'.",
     "தமிழ்": "Keep 'த' and 'மி' crisp, and finish with a clear retroflex 'ழ்'.",
@@ -49,8 +53,8 @@ SPOKEN_DROPPED_ENDINGS = ("ை", "ம்", "ன்")
 
 # Scoring cutoffs (%)
 HIGH_CONFIDENCE = 85.0
-MODERATE_CONFIDENCE = 60.0
+MODERATE_CONFIDENCE = 65.0
 WORD_MATCH_THRESHOLD = 85.0
 SPOKEN_WORD_MATCH_THRESHOLD = 78.0
-HIGH_ACOUSTIC = 75.0
+HIGH_ACOUSTIC = 72.0
 MODERATE_ACOUSTIC = 55.0

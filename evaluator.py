@@ -1,7 +1,9 @@
+from difflib import SequenceMatcher
 import io
 import os
 import subprocess
 import tempfile
+
 import numpy as np
 import torch
 from gtts import gTTS
@@ -25,6 +27,8 @@ from config import (
     VOWEL_LENGTH_PAIRS,
     WORD_MATCH_THRESHOLD,
 )
+
+
 def generate_reference_audio(text: str) -> bytes:
     cleaned = text.strip()
     if not cleaned:
@@ -34,6 +38,8 @@ def generate_reference_audio(text: str) -> bytes:
     tts = gTTS(text=cleaned, lang="ta")
     tts.write_to_fp(buffer)
     return buffer.getvalue()
+
+
 def load_asr_pipeline(model_name: str):
     device = 0 if torch.cuda.is_available() else -1
     asr_pipe = pipeline(
@@ -50,6 +56,8 @@ def load_asr_pipeline(model_name: str):
         gen_cfg.max_new_tokens = MAX_DECODE_TOKENS
         gen_cfg.no_repeat_ngram_size = 6
     return asr_pipe
+
+
 def _decode_file_pcm(path: str) -> np.ndarray:
     cmd = [
         "ffmpeg",
@@ -78,6 +86,8 @@ def _decode_file_pcm(path: str) -> np.ndarray:
         return np.array([], dtype=np.float32)
 
     return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+
+
 def decode_audio_pcm(audio_bytes: bytes, suffix: str = ".wav") -> np.ndarray:
     if not audio_bytes:
         return np.array([], dtype=np.float32)
@@ -91,11 +101,15 @@ def decode_audio_pcm(audio_bytes: bytes, suffix: str = ".wav") -> np.ndarray:
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
 def _frame_signal(samples: np.ndarray, frame_len: int, hop: int) -> np.ndarray:
     count = 1 + (samples.size - frame_len) // hop
     starts = np.arange(count) * hop
     indices = starts[:, None] + np.arange(frame_len)[None, :]
     return samples[indices]
+
+
 def _trim_silence(
     samples: np.ndarray,
     sample_rate: int = SAMPLE_RATE,
@@ -121,6 +135,7 @@ def _trim_silence(
     end = min(samples.size, int(active_idx[-1]) * hop + frame_len + pad)
     return samples[start:end]
 
+
 def transcribe_audio(asr_pipe, audio_bytes: bytes, suffix: str = ".wav") -> str:
     if not audio_bytes:
         return ""
@@ -141,6 +156,47 @@ def transcribe_audio(asr_pipe, audio_bytes: bytes, suffix: str = ".wav") -> str:
         result = asr_pipe({"array": audio_array, "sampling_rate": SAMPLE_RATE})
 
     return " ".join(result.get("text", "").strip().split())
+
+
+def extract_phonetic_embeddings(asr_pipe, samples: np.ndarray) -> np.ndarray | None:
+    if asr_pipe is None or samples.size == 0:
+        return None
+
+    trimmed = _trim_silence(samples, pad_s=0.05)
+    max_samples = MAX_AUDIO_SECONDS * SAMPLE_RATE
+    if trimmed.size > max_samples:
+        trimmed = trimmed[:max_samples]
+    if trimmed.size < int(0.05 * SAMPLE_RATE):
+        return None
+
+    feature_extractor = getattr(asr_pipe, "feature_extractor", None)
+    model = getattr(asr_pipe, "model", None)
+    if feature_extractor is None or model is None or not hasattr(model, "get_encoder"):
+        return None
+
+    try:
+        audio_array = np.ascontiguousarray(trimmed, dtype=np.float32)
+        inputs = feature_extractor(
+            audio_array,
+            sampling_rate=SAMPLE_RATE,
+            return_tensors="pt",
+        )
+        input_features = inputs.input_features.to(device=model.device, dtype=model.dtype)
+        with torch.inference_mode():
+            encoder_out = model.get_encoder()(input_features)
+        hidden = encoder_out.last_hidden_state[0].float().cpu().numpy()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+    # Whisper encoder emits 50 frames/sec (20ms stride); slice to active speech only
+    n_frames = max(2, min(hidden.shape[0], int(round((trimmed.size / SAMPLE_RATE) * 50))))
+    active = hidden[:n_frames]
+    if active.shape[0] > MAX_DTW_FRAMES:
+        idx = np.linspace(0, active.shape[0] - 1, MAX_DTW_FRAMES, dtype=int)
+        active = active[idx]
+    return active.astype(np.float32)
+
+
 def analyze_fluency(samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> dict:
     frame_len = int(0.025 * sample_rate)
     hop = int(0.010 * sample_rate)
@@ -192,6 +248,8 @@ def analyze_fluency(samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> dict
         "speech_duration_s": speech_duration_s,
         "fluency_status": status,
     }
+
+
 def _build_mel_filterbank(sample_rate: int, n_fft: int, n_mels: int = 26) -> np.ndarray:
     low_mel = 2595.0 * np.log10(1.0 + 80.0 / 700.0)
     high_mel = 2595.0 * np.log10(1.0 + (sample_rate / 2.0) / 700.0)
@@ -211,6 +269,15 @@ def _build_mel_filterbank(sample_rate: int, n_fft: int, n_mels: int = 26) -> np.
         if left == center == right:
             fbank[m - 1, center] = 1.0
     return fbank
+
+
+def _delta_features(features: np.ndarray) -> np.ndarray:
+    if features.shape[0] < 2:
+        return np.zeros_like(features)
+    padded = np.pad(features, ((1, 1), (0, 0)), mode="edge")
+    return 0.5 * (padded[2:] - padded[:-2])
+
+
 def _extract_mfcc(samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     frame_len = int(0.025 * sample_rate)
     hop = int(0.010 * sample_rate)
@@ -218,11 +285,11 @@ def _extract_mfcc(samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.nda
     n_mels = 26
 
     if samples.size < frame_len:
-        return np.empty((0, 12), dtype=np.float32)
+        return np.empty((0, 36), dtype=np.float32)
 
     samples = _trim_silence(samples, sample_rate=sample_rate, pad_s=0.0)
     if samples.size < frame_len:
-        return np.empty((0, 12), dtype=np.float32)
+        return np.empty((0, 36), dtype=np.float32)
 
     emphasized = np.append(samples[0], samples[1:] - 0.97 * samples[:-1])
     frames = _frame_signal(emphasized, frame_len, hop) * np.hamming(frame_len)
@@ -243,25 +310,25 @@ def _extract_mfcc(samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.nda
         std = np.where(std < 1e-6, 1.0, std)
         mfcc = (mfcc - mean) / std
 
-    if mfcc.shape[0] > MAX_DTW_FRAMES:
-        idx = np.linspace(0, mfcc.shape[0] - 1, MAX_DTW_FRAMES, dtype=int)
-        mfcc = mfcc[idx]
+    # Emphasize delta and delta-delta articulation dynamics to reduce speaker pitch bias
+    delta1 = _delta_features(mfcc)
+    delta2 = _delta_features(delta1)
+    combined = np.concatenate([0.5 * mfcc, delta1, delta2], axis=1)
 
-    return mfcc.astype(np.float32)
-def compare_acoustics(
-    teacher_samples: np.ndarray,
-    student_samples: np.ndarray,
-    sample_rate: int = SAMPLE_RATE,
-) -> dict:
-    t_mfcc = _extract_mfcc(teacher_samples, sample_rate)
-    s_mfcc = _extract_mfcc(student_samples, sample_rate)
+    if combined.shape[0] > MAX_DTW_FRAMES:
+        idx = np.linspace(0, combined.shape[0] - 1, MAX_DTW_FRAMES, dtype=int)
+        combined = combined[idx]
 
-    if t_mfcc.shape[0] < 2 or s_mfcc.shape[0] < 2:
-        return {"acoustic_score": None, "acoustic_label": "Unavailable"}
+    return combined.astype(np.float32)
 
-    t_norm = t_mfcc / (np.linalg.norm(t_mfcc, axis=1, keepdims=True) + 1e-8)
-    s_norm = s_mfcc / (np.linalg.norm(s_mfcc, axis=1, keepdims=True) + 1e-8)
-    cost = 1.0 - np.clip(t_norm @ s_norm.T, -1.0, 1.0)
+
+def _dtw_cosine_score(seq_a: np.ndarray, seq_b: np.ndarray) -> float | None:
+    if seq_a.shape[0] < 2 or seq_b.shape[0] < 2:
+        return None
+
+    a_norm = seq_a / (np.linalg.norm(seq_a, axis=1, keepdims=True) + 1e-8)
+    b_norm = seq_b / (np.linalg.norm(seq_b, axis=1, keepdims=True) + 1e-8)
+    cost = 1.0 - np.clip(a_norm @ b_norm.T, -1.0, 1.0)
 
     # Symmetric DTW (weights 1, 1, 2) normalized by n + m for path-length invariance
     n, m = cost.shape
@@ -285,16 +352,54 @@ def compare_acoustics(
             curr_dp[j] = v1 if v1 <= v2 and v1 <= v3 else (v2 if v2 <= v3 else v3)
 
     mean_dist = float(dp[n - 1, m - 1] / (n + m))
-    score = round(max(0.0, min(100.0, (1.0 - mean_dist) * 100.0)), 1)
+    return round(max(0.0, min(100.0, (1.0 - mean_dist) * 100.0)), 1)
+
+
+def compare_acoustics(
+    teacher_samples: np.ndarray,
+    student_samples: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    teacher_emb: np.ndarray | None = None,
+    student_emb: np.ndarray | None = None,
+) -> dict:
+    t_mfcc = _extract_mfcc(teacher_samples, sample_rate)
+    s_mfcc = _extract_mfcc(student_samples, sample_rate)
+    mfcc_score = _dtw_cosine_score(t_mfcc, s_mfcc)
+
+    emb_score = None
+    if (
+        teacher_emb is not None
+        and student_emb is not None
+        and teacher_emb.shape[0] >= 2
+        and student_emb.shape[0] >= 2
+    ):
+        shared_mean = np.mean(np.vstack([teacher_emb, student_emb]), axis=0, keepdims=True)
+        t_centered = teacher_emb - shared_mean
+        s_centered = student_emb - shared_mean
+        if np.linalg.norm(t_centered) > 1e-6 and np.linalg.norm(s_centered) > 1e-6:
+            emb_score = _dtw_cosine_score(t_centered, s_centered)
+        else:
+            emb_score = _dtw_cosine_score(teacher_emb, student_emb)
+
+    if emb_score is not None and mfcc_score is not None:
+        score = round(0.65 * emb_score + 0.35 * mfcc_score, 1)
+    elif emb_score is not None:
+        score = emb_score
+    elif mfcc_score is not None:
+        score = mfcc_score
+    else:
+        return {"acoustic_score": None, "acoustic_label": "Unavailable"}
 
     if score >= HIGH_ACOUSTIC:
-        label = "Close Match"
+        label = "Native-Like Match"
     elif score >= MODERATE_ACOUSTIC:
-        label = "Moderate Match"
+        label = "Slight Accent Gap"
     else:
-        label = "Distant"
+        label = "Strong Accent Gap"
 
     return {"acoustic_score": score, "acoustic_label": label}
+
+
 def validate_tamil_script(text: str) -> dict:
     cleaned = text.strip()
     if not cleaned:
@@ -304,6 +409,7 @@ def validate_tamil_script(text: str) -> dict:
             "has_latin": False,
             "message": "No speech or Tamil text detected.",
         }
+
     tamil_count = 0
     latin_count = 0
     other_alpha = 0
@@ -346,6 +452,8 @@ def validate_tamil_script(text: str) -> dict:
         "has_latin": False,
         "message": message,
     }
+
+
 def segment_tamil_graphemes(text: str) -> list[str]:
     # Keep Tamil combining vowel signs and pulli attached to their base consonant
     graphemes: list[str] = []
@@ -358,8 +466,27 @@ def segment_tamil_graphemes(text: str) -> list[str]:
         else:
             graphemes.append(ch)
     return graphemes
+
+
 def _compact_tamil(text: str) -> str:
     return "".join(ch for ch in text if not ch.isspace())
+
+
+def _tamil_similarity(spoken: str, target: str) -> float:
+    compact_spoken = _compact_tamil(spoken)
+    compact_target = _compact_tamil(target)
+    char_sim = float(fuzz.ratio(compact_spoken, compact_target))
+    grapheme_sim = (
+        SequenceMatcher(
+            None,
+            segment_tamil_graphemes(compact_spoken),
+            segment_tamil_graphemes(compact_target),
+        ).ratio()
+        * 100.0
+    )
+    # Blend codepoint and Tamil syllable similarity so shared pulli marks do not inflate wrong words
+    return round((char_sim + grapheme_sim) / 2.0, 1)
+
 
 def _normalize_spoken_tamil(text: str) -> str:
     # Normalize common conversational Tamil word-final diglossia drops
@@ -372,6 +499,21 @@ def _normalize_spoken_tamil(text: str) -> str:
                 break
         normalized_words.append(base)
     return "".join(normalized_words)
+
+
+def _target_accent_tips(compact_target: str, target: str, syllable_guide: str) -> list[str]:
+    steps: list[str] = []
+    for group in CONFUSION_GROUPS:
+        if any(ch in compact_target for ch in group["chars"]):
+            steps.append(group["solution"])
+    for sign, _, solution in VOWEL_LENGTH_PAIRS:
+        if sign in compact_target:
+            steps.append(solution)
+            break
+    if not steps:
+        steps.append("Keep each Tamil syllable crisp and evenly timed without heavy stress shifts.")
+    steps.append(f"Say '{target}' syllable by syllable like the Teacher: {syllable_guide}.")
+    return steps
 
 
 def evaluate_teacher(teacher_text: str, fluency: dict | None = None) -> dict:
@@ -401,31 +543,42 @@ def _analyze_pronunciation(
     spoken: str,
     target: str,
     similarity: float,
+    wording_match: bool,
     diglossia_accepted: bool,
     acoustic: dict | None,
     fluency: dict | None,
-) -> tuple[str, str]:
+) -> tuple[str, list[str]]:
     compact_spoken = _compact_tamil(spoken)
     compact_target = _compact_tamil(target)
     target_graphemes = segment_tamil_graphemes(compact_target)
     spoken_graphemes = segment_tamil_graphemes(compact_spoken)
     syllable_guide = " · ".join(target_graphemes)
+    acoustic_score = acoustic.get("acoustic_score") if acoustic else None
 
     notes: list[str] = []
-    fixes: list[str] = []
+    steps: list[str] = []
 
-    if compact_spoken == compact_target:
-        notes.append("Exact Tamil articulation matching the Teacher's syllable structure.")
-    elif diglossia_accepted:
-        notes.append("Natural spoken Tamil (diglossia) ending accepted in conversational mode.")
-        fixes.append(
-            f"Acceptable in spoken Tamil. For formal literary delivery, pronounce all syllables of '{target}': {syllable_guide}."
-        )
-    elif similarity < MODERATE_CONFIDENCE:
-        notes.append(f"Word mismatch detected: Student said '{spoken}' instead of '{target}'.")
-        fixes.append(
-            f"Listen to the Teacher's clip again and practice '{target}' slowly syllable by syllable: {syllable_guide}."
-        )
+    if similarity < MODERATE_CONFIDENCE:
+        notes.append(f"Different word spoken: Student said '{spoken}' instead of '{target}'.")
+        steps.append(f"Target word is '{target}' — practice it slowly syllable by syllable: {syllable_guide}.")
+        steps.append("Listen to the Teacher's clip and the reference audio below, then repeat clearly.")
+        return " ".join(notes), steps
+
+    if wording_match:
+        if acoustic_score is not None and acoustic_score < HIGH_ACOUSTIC:
+            gap_type = "strong" if acoustic_score < MODERATE_ACOUSTIC else "noticeable"
+            notes.append(
+                f"Right Tamil word recognized, with a {gap_type} pronunciation and accent gap compared to the Teacher."
+            )
+            steps.extend(_target_accent_tips(compact_target, target, syllable_guide))
+        elif diglossia_accepted:
+            notes.append("Natural spoken Tamil (diglossia) pronunciation matched cleanly.")
+            steps.append(
+                f"Acceptable in spoken Tamil. For formal literary delivery, pronounce every syllable of '{target}': {syllable_guide}."
+            )
+        else:
+            notes.append("Clear Tamil pronunciation and wording closely matching the Teacher.")
+            steps.append("No correction needed. Keep maintaining this clarity and pace.")
     else:
         for group in CONFUSION_GROUPS:
             chars = group["chars"]
@@ -433,42 +586,34 @@ def _analyze_pronunciation(
             spoken_counts = {c: compact_spoken.count(c) for c in chars}
             if target_counts != spoken_counts and any(target_counts.values()):
                 notes.append(group["description"])
-                fixes.append(group["solution"])
+                steps.append(group["solution"])
 
         for sign, description, solution in VOWEL_LENGTH_PAIRS:
             if compact_target.count(sign) != compact_spoken.count(sign):
                 notes.append(description)
-                fixes.append(solution)
+                steps.append(solution)
 
         diff = len(spoken_graphemes) - len(target_graphemes)
         if diff < 0:
-            notes.append("Shortened or incomplete syllable delivery (possible spoken diglossia drop).")
-            fixes.append(
-                f"Articulate all {len(target_graphemes)} syllables completely without dropping endings: {syllable_guide}."
+            notes.append("Shortened or incomplete syllable delivery.")
+            steps.append(
+                f"Pronounce all {len(target_graphemes)} syllables completely without dropping endings: {syllable_guide}."
             )
         elif diff > 0:
             notes.append("Extra syllables or trailing sounds detected.")
-            fixes.append(
-                f"Speak '{target}' smoothly in one breath without extra pauses or trailing sounds: {syllable_guide}."
+            steps.append(
+                f"Say '{target}' smoothly in one breath without extra trailing sounds: {syllable_guide}."
             )
 
         if not notes:
-            notes.append("Minor syllable variation compared to the Teacher's pronunciation.")
-            fixes.append(f"Replay the Teacher's audio and repeat each syllable cleanly: {syllable_guide}.")
-
-    if acoustic and acoustic.get("acoustic_score") is not None:
-        if acoustic["acoustic_score"] < MODERATE_ACOUSTIC and similarity >= MODERATE_CONFIDENCE:
-            notes.append("Acoustic delivery (tone/stress) differed noticeably from the Teacher's audio.")
-            fixes.append("Match the Teacher's syllable stress and speaking rhythm more closely.")
+            notes.append("Minor syllable articulation difference compared to the Teacher.")
+            steps.append(f"Repeat '{target}' cleanly syllable by syllable: {syllable_guide}.")
 
     if fluency and fluency.get("pause_count", 0) >= 2:
-        notes.append(f"Audio pacing was choppy ({fluency['pause_count']} pauses detected).")
-        fixes.append(f"Try saying '{target}' continuously without breaking between syllables.")
+        notes.append(f"Choppy pacing ({fluency['pause_count']} mid-utterance pauses detected).")
+        steps.append(f"Speak '{target}' smoothly in one breath without pausing between syllables.")
 
-    if not fixes:
-        fixes.append("No correction needed. Keep maintaining this clarity and pace.")
-
-    return "; ".join(notes), " ".join(fixes)
+    return "; ".join(notes), steps
 
 
 def evaluate_pronunciation(
@@ -491,15 +636,19 @@ def evaluate_pronunciation(
     fluency_status = fluency["fluency_status"] if fluency else "Not measured"
 
     if not target_check["is_valid"]:
+        step = "Record or confirm a valid Tamil word or phrase from the Teacher first."
         return {
             "transcription": spoken,
             "target": target,
             "mode": eval_mode,
             "wording_match": False,
+            "pronunciation_match": False,
             "similarity": 0.0,
+            "overall_score": 0.0,
             "pronunciation_status": "Invalid Benchmark",
             "characteristics": "Teacher recording did not produce a valid Tamil benchmark.",
-            "solution": "Record or confirm a valid Tamil word or phrase from the Teacher first.",
+            "solution": step,
+            "coaching_steps": [step],
             "syllable_breakdown": "",
             "confidence_score": 0.0,
             "confidence_label": "Low",
@@ -514,15 +663,19 @@ def evaluate_pronunciation(
     syllable_breakdown = " · ".join(segment_tamil_graphemes(target))
 
     if not spoken_check["is_valid"]:
+        step = f"Re-record clearly in pure Tamil matching '{target}' ({syllable_breakdown})."
         return {
             "transcription": spoken,
             "target": target,
             "mode": eval_mode,
             "wording_match": False,
+            "pronunciation_match": False,
             "similarity": 0.0,
+            "overall_score": 0.0,
             "pronunciation_status": "Invalid Input",
             "characteristics": spoken_check["message"],
-            "solution": f"Re-record clearly in pure Tamil matching '{target}' ({syllable_breakdown}).",
+            "solution": step,
+            "coaching_steps": [step],
             "syllable_breakdown": syllable_breakdown,
             "confidence_score": 0.0,
             "confidence_label": "Low",
@@ -534,16 +687,13 @@ def evaluate_pronunciation(
             "fluency_status": fluency_status,
         }
 
-    # Compare compact Tamil text so spurious ASR spaces do not penalize clean speech
-    compact_spoken = _compact_tamil(spoken)
-    compact_target = _compact_tamil(target)
-    raw_similarity = round(float(fuzz.ratio(compact_spoken, compact_target)), 1)
+    raw_similarity = _tamil_similarity(spoken, target)
 
     diglossia_accepted = False
     if eval_mode == "spoken":
-        spoken_sim = round(
-            float(fuzz.ratio(_normalize_spoken_tamil(spoken), _normalize_spoken_tamil(target))),
-            1,
+        spoken_sim = _tamil_similarity(
+            _normalize_spoken_tamil(spoken),
+            _normalize_spoken_tamil(target),
         )
         similarity = max(raw_similarity, spoken_sim)
         match_threshold = SPOKEN_WORD_MATCH_THRESHOLD
@@ -555,33 +705,71 @@ def evaluate_pronunciation(
     wording_match = similarity >= match_threshold
     confidence_score = round(similarity * (spoken_check["purity"] / 100.0), 1)
 
-    if confidence_score >= HIGH_CONFIDENCE or diglossia_accepted:
-        confidence_label = "High"
-        status = "Accurate (Spoken)" if diglossia_accepted else "Accurate"
-    elif confidence_score >= MODERATE_CONFIDENCE:
-        confidence_label = "Moderate"
-        status = "Partial / Rough"
-    else:
+    if similarity < MODERATE_CONFIDENCE:
+        overall_score = (
+            round(min(confidence_score, 0.50 * confidence_score + 0.50 * acoustic_score), 1)
+            if acoustic_score is not None
+            else confidence_score
+        )
+        pronunciation_match = False
         confidence_label = "Low"
-        status = "Mismatch"
+        status = "Word Mismatch"
+    elif wording_match:
+        if acoustic_score is None:
+            overall_score = confidence_score
+            pronunciation_match = True
+            confidence_label = "High" if (confidence_score >= HIGH_CONFIDENCE or diglossia_accepted) else "Moderate"
+            status = (
+                "Accurate Pronunciation (Spoken)"
+                if diglossia_accepted
+                else "Accurate Pronunciation"
+            )
+        else:
+            overall_score = round(0.40 * confidence_score + 0.60 * acoustic_score, 1)
+            if acoustic_score >= HIGH_ACOUSTIC:
+                pronunciation_match = True
+                confidence_label = "High"
+                status = (
+                    "Accurate Pronunciation (Spoken)"
+                    if diglossia_accepted
+                    else "Accurate Pronunciation"
+                )
+            else:
+                pronunciation_match = False
+                confidence_label = "Moderate" if acoustic_score >= MODERATE_ACOUSTIC else "Low"
+                status = "Right Word, Pronunciation Needs Work"
+    else:
+        overall_score = (
+            round(0.55 * confidence_score + 0.45 * acoustic_score, 1)
+            if acoustic_score is not None
+            else confidence_score
+        )
+        pronunciation_match = False
+        confidence_label = "Moderate" if overall_score >= MODERATE_CONFIDENCE else "Low"
+        status = "Phonetic Shift Detected"
 
-    characteristics, solution = _analyze_pronunciation(
+    characteristics, coaching_steps = _analyze_pronunciation(
         spoken,
         target,
         similarity,
+        wording_match,
         diglossia_accepted,
         acoustic,
         fluency,
     )
+
     return {
         "transcription": spoken,
         "target": target,
         "mode": eval_mode,
         "wording_match": wording_match,
+        "pronunciation_match": pronunciation_match,
         "similarity": similarity,
+        "overall_score": overall_score,
         "pronunciation_status": status,
         "characteristics": characteristics,
-        "solution": solution,
+        "solution": " ".join(coaching_steps),
+        "coaching_steps": coaching_steps,
         "syllable_breakdown": syllable_breakdown,
         "confidence_score": confidence_score,
         "confidence_label": confidence_label,

@@ -3,6 +3,7 @@ streamlit>=1.39.0
 transformers
 torch
 accelerate
+numpy
 rapidfuzz
 gTTS
 pytest
