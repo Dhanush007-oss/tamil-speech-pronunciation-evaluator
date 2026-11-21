@@ -11,6 +11,7 @@ from rapidfuzz import fuzz
 from transformers import pipeline
 
 from config import (
+    ASR_NUM_BEAMS,
     CONFUSION_GROUPS,
     FFMPEG_TIMEOUT_S,
     HIGH_ACOUSTIC,
@@ -47,10 +48,11 @@ def load_asr_pipeline(model_name: str):
         model=model_name,
         device=device,
     )
-    # Greedy decoding + token cap prevents multi-minute CPU stalls and repeat loops
+    # Small beam search recovers soft/accented Tamil onsets while token cap blocks CPU stalls
     gen_cfg = getattr(asr_pipe.model, "generation_config", None)
     if gen_cfg is not None:
-        gen_cfg.num_beams = 1
+        gen_cfg.num_beams = ASR_NUM_BEAMS
+        gen_cfg.early_stopping = True
         gen_cfg.do_sample = False
         gen_cfg.max_length = None
         gen_cfg.max_new_tokens = MAX_DECODE_TOKENS
@@ -113,7 +115,7 @@ def _frame_signal(samples: np.ndarray, frame_len: int, hop: int) -> np.ndarray:
 def _trim_silence(
     samples: np.ndarray,
     sample_rate: int = SAMPLE_RATE,
-    pad_s: float = 0.15,
+    pad_s: float = 0.30,
 ) -> np.ndarray:
     frame_len = int(0.025 * sample_rate)
     hop = int(0.010 * sample_rate)
@@ -123,10 +125,11 @@ def _trim_silence(
     frames = _frame_signal(samples, frame_len, hop)
     rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
     peak = float(np.max(rms))
-    if peak < 0.008:
+    if peak < 0.004:
         return samples
 
-    active_idx = np.flatnonzero(rms > max(0.008, peak * 0.12))
+    # Low onset threshold keeps soft Tamil consonants like 'வ' and 'ம' intact
+    active_idx = np.flatnonzero(rms > max(0.004, peak * 0.05))
     if active_idx.size == 0:
         return samples
 
@@ -134,6 +137,23 @@ def _trim_silence(
     start = max(0, int(active_idx[0]) * hop - pad)
     end = min(samples.size, int(active_idx[-1]) * hop + frame_len + pad)
     return samples[start:end]
+
+
+def _prepare_asr_audio(samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+    trimmed = _trim_silence(samples, sample_rate=sample_rate, pad_s=0.30)
+    cushion_len = int(0.20 * sample_rate)
+    max_speech_samples = max(1, MAX_AUDIO_SECONDS * sample_rate - 2 * cushion_len)
+    if trimmed.size > max_speech_samples:
+        trimmed = trimmed[:max_speech_samples]
+
+    centered = trimmed - float(np.mean(trimmed))
+    peak_abs = float(np.max(np.abs(centered)))
+    if peak_abs < 0.004:
+        return np.array([], dtype=np.float32)
+
+    normalized = centered * (0.90 / peak_abs)
+    cushion = np.zeros(cushion_len, dtype=np.float32)
+    return np.ascontiguousarray(np.concatenate([cushion, normalized, cushion]), dtype=np.float32)
 
 
 def transcribe_audio(asr_pipe, audio_bytes: bytes, suffix: str = ".wav") -> str:
@@ -144,12 +164,9 @@ def transcribe_audio(asr_pipe, audio_bytes: bytes, suffix: str = ".wav") -> str:
     if samples.size == 0:
         return ""
 
-    trimmed = _trim_silence(samples)
-    max_samples = MAX_AUDIO_SECONDS * SAMPLE_RATE
-    if trimmed.size > max_samples:
-        trimmed = trimmed[:max_samples]
-
-    audio_array = np.ascontiguousarray(trimmed, dtype=np.float32)
+    audio_array = _prepare_asr_audio(samples)
+    if audio_array.size == 0:
+        return ""
 
     # Pass decoded PCM directly so Whisper runs once without a second FFmpeg call
     with torch.inference_mode():
